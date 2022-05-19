@@ -56,6 +56,26 @@ from omegaconf import OmegaConf, open_dict
 import pytorch_lightning.plugins.environments.lightning_environment as le
 
 
+
+def transform_points(points, tform, points_scale=None, out_scale=None):
+    points_2d = points[:,:,:2]
+        
+    #'input points must use original range'
+    if points_scale:
+        assert points_scale[0]==points_scale[1]
+        points_2d = (points_2d*0.5 + 0.5)*points_scale[0]
+
+    batch_size, n_points, _ = points.shape
+    trans_points_2d = torch.bmm(
+                    torch.cat([points_2d, torch.ones([batch_size, n_points, 1], device=points.device, dtype=points.dtype)], dim=-1), 
+                    tform
+                    ) 
+    if out_scale: # h,w of output image size
+        trans_points_2d[:,:,0] = trans_points_2d[:,:,0]/out_scale[1]*2 - 1
+        trans_points_2d[:,:,1] = trans_points_2d[:,:,1]/out_scale[0]*2 - 1
+    trans_points = torch.cat([trans_points_2d[:,:,:2], points[:,:,2:]], dim=-1)
+    return trans_points
+
 class DecaMode(Enum):
     COARSE = 1 # when switched on, only coarse part of DECA-based networks is used
     DETAIL = 2 # when switched on, only coarse and detail part of DECA-based networks is used 
@@ -796,6 +816,12 @@ class DecaModule(LightningModule):
 
         return detail_conditioning_list
 
+    def visofp(self, normals):
+        ''' visibility of keypoints, based on the normal direction
+        '''
+        normals68 = self.deca.flame.seletec_3d68(normals)
+        vis68 = (normals68[:,:,2:] < 0.1).float()
+        return vis68
 
     def decode(self, codedict, training=True, **kwargs) -> dict:
         """
@@ -840,6 +866,19 @@ class DecaModule(LightningModule):
         mask_face_eye = F.grid_sample(self.deca.uv_face_eye_mask.expand(effective_batch_size, -1, -1, -1),
                                       ops['grid'].detach(),
                                       align_corners=False)
+
+        if 'tform' in kwargs:
+            ## projection
+            original_image = kwargs["original_image"]
+            landmarks3d_vis = self.visofp(ops['transformed_normals'])#/self.image_size
+            landmarks2d = util.batch_orth_proj(landmarks2d, codedict['cam'])[:,:,:2]; landmarks2d[:,:,1:] = -landmarks2d[:,:,1:]#; landmarks2d = landmarks2d*self.image_size/2 + self.image_size/2
+            landmarks3d = util.batch_orth_proj(landmarks3d, codedict['cam']); landmarks3d[:,:,1:] = -landmarks3d[:,:,1:] #; landmarks3d = landmarks3d*self.image_size/2 + self.image_size/2
+            landmarks3d = torch.cat([landmarks3d, landmarks3d_vis], dim=2)
+            points_scale = [self.deca.config.image_size, self.deca.config.image_size]
+            _, _, h, w = original_image.shape
+            landmarks2d = transform_points(landmarks2d, kwargs['tform'], points_scale, [h, w])
+            landmarks3d = transform_points(landmarks3d, kwargs['tform'], points_scale, [h, w])
+
         # images
         predicted_images = ops['images']
         # predicted_images = ops['images'] * mask_face_eye * ops['alpha_images']
@@ -1036,6 +1075,7 @@ class DecaModule(LightningModule):
         codedict['masks'] = masks
         codedict['normals'] = ops['normals']
 
+        vis_dict = {'inputs': codedict['images']}
         if self.mode == DecaMode.DETAIL:
             codedict['predicted_detailed_translated_image'] = predicted_detailed_translated_image
             codedict['translated_uv_texture'] = translated_uv_texture
@@ -1048,7 +1088,15 @@ class DecaModule(LightningModule):
             codedict['uv_mask'] = uv_mask
             codedict['displacement_map'] = uv_z + self.deca.fixed_uv_dis[None, None, :, :]
 
-        return codedict
+            vis_dict['landmarks2d'] = util.tensor_vis_landmarks(codedict['images'], landmarks2d)
+            vis_dict['landmarks3d'] = util.tensor_vis_landmarks(codedict['images'], landmarks3d)
+            vis_dict['shape_images'] = self.deca.render.render_shape(verts, trans_verts)
+            detail_normal_images = F.grid_sample(uv_detail_normals.detach(), grid.detach(),
+                                                    align_corners=False)
+            vis_dict['shape_detail_images'] = self.deca.render.render_shape(verts, trans_verts,
+                                                            detail_normal_images=detail_normal_images)
+            vis_dict['rendered_image'] = self.deca.render(verts, trans_verts, uv_texture, lightcode)["images"]
+        return codedict, vis_dict
 
     def _compute_emotion_loss(self, images, predicted_images, loss_dict, metric_dict, prefix, va=None, expr7=None, with_grad=True,
                               batch_size=None, ring_size=None):
@@ -2472,8 +2520,8 @@ class DECA(torch.nn.Module):
         self.register_buffer('fixed_uv_dis', fixed_uv_dis)
 
     def uses_texture(self): 
-        if 'use_texture' in self.config.keys():
-            return self.config.use_texture
+        # if 'use_texture' in self.config.keys():
+        #     return self.config.use_texture
         return True # true by default
 
     def _disable_texture(self, remove_from_model=False): 
