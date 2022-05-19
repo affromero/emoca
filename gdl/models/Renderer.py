@@ -138,14 +138,22 @@ class Pytorch3dRasterizer(nn.Module):
         raster_settings = util.dict2obj(raster_settings)
         self.raster_settings = raster_settings
 
-    def forward(self, vertices, faces, attributes=None):
+    def forward(self, vertices, faces, attributes=None, h=None, w=None):
         fixed_vertices = vertices.clone()
         fixed_vertices[..., :2] = -fixed_vertices[..., :2]
-        meshes_screen = Meshes(verts=fixed_vertices.float(), faces=faces.long())
         raster_settings = self.raster_settings
+        if h is None and w is None:
+            image_size = raster_settings.image_size
+        else:
+            image_size = [h, w]
+            if h>w:
+                fixed_vertices[..., 1] = fixed_vertices[..., 1]*h/w
+            else:
+                fixed_vertices[..., 0] = fixed_vertices[..., 0]*w/h
+        meshes_screen = Meshes(verts=fixed_vertices.float(), faces=faces.long())
         pix_to_face, zbuf, bary_coords, dists = rasterize_meshes(
             meshes_screen,
-            image_size=raster_settings.image_size,
+            image_size=image_size,
             blur_radius=raster_settings.blur_radius,
             faces_per_pixel=raster_settings.faces_per_pixel,
             bin_size=raster_settings.bin_size,
@@ -348,7 +356,7 @@ class SRenderY(nn.Module):
         shading = normals_dot_lights[:, :, :, None] * light_intensities[:, :, None, :]
         return shading.mean(1)
 
-    def render_shape(self, vertices, transformed_vertices, images=None, detail_normal_images=None, lights=None):
+    def render_shape(self, vertices, transformed_vertices, images=None, detail_normal_images=None, lights=None, h=None, w=None, return_grid=False):
         '''
         -- rendering shape with detail normal map
         '''
@@ -376,10 +384,12 @@ class SRenderY(nn.Module):
         attributes = torch.cat([self.face_colors.expand(batch_size, -1, -1, -1),
                                 transformed_face_normals.detach(),
                                 face_vertices.detach(),
-                                face_normals],
+                                face_normals,
+                                self.face_uvcoords.expand(batch_size, -1, -1, -1)],
                                -1)
         # rasterize
-        rendering = self.rasterizer(transformed_vertices, self.faces.expand(batch_size, -1, -1), attributes)
+        # rendering = self.rasterizer(transformed_vertices, self.faces.expand(batch_size, -1, -1), attributes)
+        rendering = self.rasterizer(transformed_vertices, self.faces.expand(batch_size, -1, -1), attributes, h, w)
 
         ####
         alpha_images = rendering[:, -1, :, :][:, None, :, :].detach()
@@ -406,8 +416,14 @@ class SRenderY(nn.Module):
             shape_images = shaded_images * alpha_images + torch.zeros_like(shaded_images).to(vertices.device) * (
                         1 - alpha_images)
         else:
+            alpha_images = alpha_images*pos_mask
             shape_images = shaded_images * alpha_images + images * (1 - alpha_images)
-        return shape_images
+        if return_grid:
+            uvcoords_images = rendering[:, 12:15, :, :]; 
+            grid = (uvcoords_images).permute(0, 2, 3, 1)[:, :, :, :2]
+            return shape_images, normal_images, grid, alpha_images
+        else:
+            return shape_images
 
     def render_depth(self, transformed_vertices):
         '''

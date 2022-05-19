@@ -733,7 +733,10 @@ def tensor_vis_landmarks(images, landmarks, gt_landmarks=None, color='g', isScal
         if scale_colors:
             image = image * 255
         if isScale:
-            predicted_landmark = predicted_landmarks[i] * image.shape[0] / 2 + image.shape[0] / 2
+            # predicted_landmark = predicted_landmarks[i] * image.shape[0] / 2 + image.shape[0] / 2
+            predicted_landmark = predicted_landmarks[i]
+            predicted_landmark[...,0] = predicted_landmark[...,0]*image.shape[1]/2 + image.shape[1]/2
+            predicted_landmark[...,1] = predicted_landmark[...,1]*image.shape[0]/2 + image.shape[0]/2
         else:
             predicted_landmark = predicted_landmarks[i]
         if predicted_landmark.shape[0] == 68:

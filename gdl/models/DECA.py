@@ -867,17 +867,24 @@ class DecaModule(LightningModule):
                                       ops['grid'].detach(),
                                       align_corners=False)
 
-        if 'tform' in kwargs:
+        if 'tform' in kwargs and kwargs['tform'] is not None:
             ## projection
             original_image = kwargs["original_image"]
+            tform = kwargs["tform"]
             landmarks3d_vis = self.visofp(ops['transformed_normals'])#/self.image_size
-            landmarks2d = util.batch_orth_proj(landmarks2d, codedict['cam'])[:,:,:2]; landmarks2d[:,:,1:] = -landmarks2d[:,:,1:]#; landmarks2d = landmarks2d*self.image_size/2 + self.image_size/2
             landmarks3d = util.batch_orth_proj(landmarks3d, codedict['cam']); landmarks3d[:,:,1:] = -landmarks3d[:,:,1:] #; landmarks3d = landmarks3d*self.image_size/2 + self.image_size/2
             landmarks3d = torch.cat([landmarks3d, landmarks3d_vis], dim=2)
             points_scale = [self.deca.config.image_size, self.deca.config.image_size]
             _, _, h, w = original_image.shape
-            landmarks2d = transform_points(landmarks2d, kwargs['tform'], points_scale, [h, w])
-            landmarks3d = transform_points(landmarks3d, kwargs['tform'], points_scale, [h, w])
+            # import ipdb; ipdb.set_trace()
+            landmarks2d = transform_points(predicted_landmarks, tform, points_scale, [h, w])
+            landmarks3d = transform_points(landmarks3d, tform, points_scale, [h, w])
+            trans_verts = transform_points(trans_verts, tform, points_scale, [h, w])
+            images = original_image
+            background = original_image
+        else:
+            h, w = self.image_size, self.image_size
+            background = None
 
         # images
         predicted_images = ops['images']
@@ -905,14 +912,14 @@ class DecaModule(LightningModule):
             dims = masks.ndim == 3
             if dims:
                 masks = masks[:, None, :, :]
-            masks = F.interpolate(masks, size=predicted_images.shape[-2:], mode='bilinear')
+            masks = F.interpolate(masks, size=predicted_images.shape[-2:], mode='bilinear', align_corners=False)
             if dims:
                 masks = masks[:, 0, ...]
 
         # resize images if need be (this is only done if configuration was changed at some point after training)
         if images.shape[-1] != predicted_images.shape[-1] or images.shape[-2] != predicted_images.shape[-2]:
             ## special case only for inference time if the rendering image sizes have been changed
-            images_resized = F.interpolate(images, size=predicted_images.shape[-2:], mode='bilinear')
+            images_resized = F.interpolate(images, size=predicted_images.shape[-2:], mode='bilinear', align_corners=False)
         else:
             images_resized = images
 
@@ -1003,7 +1010,7 @@ class DecaModule(LightningModule):
             # --- extract texture
             uv_pverts = self.deca.render.world2uv(trans_verts).detach()
             uv_gt = F.grid_sample(torch.cat([images_resized, masks], dim=1), uv_pverts.permute(0, 2, 3, 1)[:, :, :, :2],
-                                  mode='bilinear')
+                                  mode='bilinear', align_corners=False)
             uv_texture_gt = uv_gt[:, :3, :, :].detach()
             uv_mask_gt = uv_gt[:, 3:, :, :].detach()
             # self-occlusion
@@ -1075,7 +1082,7 @@ class DecaModule(LightningModule):
         codedict['masks'] = masks
         codedict['normals'] = ops['normals']
 
-        vis_dict = {'inputs': codedict['images']}
+        vis_dict = dict()
         if self.mode == DecaMode.DETAIL:
             codedict['predicted_detailed_translated_image'] = predicted_detailed_translated_image
             codedict['translated_uv_texture'] = translated_uv_texture
@@ -1087,15 +1094,16 @@ class DecaModule(LightningModule):
             codedict['uv_vis_mask'] = uv_vis_mask
             codedict['uv_mask'] = uv_mask
             codedict['displacement_map'] = uv_z + self.deca.fixed_uv_dis[None, None, :, :]
-
-            vis_dict['landmarks2d'] = util.tensor_vis_landmarks(codedict['images'], landmarks2d)
-            vis_dict['landmarks3d'] = util.tensor_vis_landmarks(codedict['images'], landmarks3d)
-            vis_dict['shape_images'] = self.deca.render.render_shape(verts, trans_verts)
-            detail_normal_images = F.grid_sample(uv_detail_normals.detach(), grid.detach(),
-                                                    align_corners=False)
-            vis_dict['shape_detail_images'] = self.deca.render.render_shape(verts, trans_verts,
-                                                            detail_normal_images=detail_normal_images)
-            vis_dict['rendered_image'] = self.deca.render(verts, trans_verts, uv_texture, lightcode)["images"]
+            if 'tform' in kwargs:
+                vis_dict['inputs'] = kwargs["original_image"]
+                vis_dict['landmarks2d'] = util.tensor_vis_landmarks(images, landmarks2d)
+                vis_dict['landmarks3d'] = util.tensor_vis_landmarks(images, landmarks3d)
+                vis_dict['shape_images'], _, grid, alpha_images = self.deca.render.render_shape(verts, trans_verts, h=h, w=w, images=background, return_grid=True)
+                detail_normal_images = F.grid_sample(uv_detail_normals.detach(), grid.detach(),
+                                                        align_corners=False)*alpha_images
+                vis_dict['shape_detail_images'] = self.deca.render.render_shape(verts, trans_verts,
+                                                                detail_normal_images=detail_normal_images, h=h, w=w, images=background)
+                vis_dict['rendered_image'] = self.deca.render(verts, trans_verts, uv_texture, lightcode)["images"]
         return codedict, vis_dict
 
     def _compute_emotion_loss(self, images, predicted_images, loss_dict, metric_dict, prefix, va=None, expr7=None, with_grad=True,
@@ -1821,15 +1829,15 @@ class DecaModule(LightningModule):
                     uv_texture_patch = F.interpolate(
                         uv_texture[:geom_losses_idxs, :, self.deca.face_attr_mask[pi][2]:self.deca.face_attr_mask[pi][3],
                         self.deca.face_attr_mask[pi][0]:self.deca.face_attr_mask[pi][1]],
-                        [new_size, new_size], mode='bilinear')
+                        [new_size, new_size], mode='bilinear', align_corners=False)
                     uv_texture_gt_patch = F.interpolate(
                         uv_texture_gt[:geom_losses_idxs, :, self.deca.face_attr_mask[pi][2]:self.deca.face_attr_mask[pi][3],
                         self.deca.face_attr_mask[pi][0]:self.deca.face_attr_mask[pi][1]], [new_size, new_size],
-                        mode='bilinear')
+                        mode='bilinear', align_corners=False)
                     uv_vis_mask_patch = F.interpolate(
                         uv_vis_mask[:geom_losses_idxs, :, self.deca.face_attr_mask[pi][2]:self.deca.face_attr_mask[pi][3],
                         self.deca.face_attr_mask[pi][0]:self.deca.face_attr_mask[pi][1]],
-                        [new_size, new_size], mode='bilinear')
+                        [new_size, new_size], mode='bilinear', align_corners=False)
 
                     detail_l1 = (uv_texture_patch * uv_vis_mask_patch - uv_texture_gt_patch * uv_vis_mask_patch).abs().mean() * \
                                                         self.deca.config.sfsw[pi]
@@ -1857,7 +1865,7 @@ class DecaModule(LightningModule):
                             translated_uv_texture[:geom_losses_idxs, :,
                             self.deca.face_attr_mask[pi][2]:self.deca.face_attr_mask[pi][3],
                             self.deca.face_attr_mask[pi][0]:self.deca.face_attr_mask[pi][1]],
-                            [new_size, new_size], mode='bilinear')
+                            [new_size, new_size], mode='bilinear', align_corners=False)
 
                         translated_detail_l1 = (translated_uv_texture_patch * uv_vis_mask_patch
                                      - uv_texture_gt_patch * uv_vis_mask_patch).abs().mean() * \
